@@ -9,45 +9,104 @@ try:
 except ImportError:
     import json
 
+try:
+    import os
+except ImportError:
+    os = None
+
 
 # ==================================================
 # LAB CONTROL PANEL / DECADE RESISTOR BOX
 #
 # CURRENT HARDWARE:
-# - Raspberry Pi Pico / RP2040
+# - Pico / RP2040
 # - Main 128x64 SSD1306 OLED on I2C0
-# - Six encoders and their pushbuttons
+# - Six rotary encoders and pushbuttons
 # - MCP23017 #1 and #2
 # - ULN2803 LED stand-ins / future relay drivers
 # - TCA9548A on I2C1
-# - Six 128x32 SSD1306 OLEDs
+# - Six 128x32 SSD1306 OLEDs on TCA channels 0 to 5
 #
 # FUTURE PROVISIONS:
-# - Up to 12 logical RGBW lighting ports
-# - INA226 / INA228 current / voltage meter
-# - Temperature sensor and PWM fan
-# - Reversible DC actuator driver
-# - Tool, Hall, microswitch, and RFID sensors
+# - Up to 12 logical RGBW LED zones
+# - INA226 / INA228 voltage and current monitor
+# - Temperature sensor and fan controller
+# - Linear actuator H-bridge
+# - Tool-presence sensors
 #
-# IMPORTANT:
-# - Use Ctrl-C in Thonny to interrupt normal operation.
-# - For reliable safe boot:
-#     GP15 ---- pushbutton / jumper ---- GND
-#   Hold this switch while reset/power-up.
+# SAFE BOOT:
+# GP15 ---- button/jumper ---- GND
+#
+# Hold GP15 LOW during reset/power-up to enter Safe Mode.
+# Safe Mode prevents the main loop from starting.
 # ==================================================
 
 
 # ==================================================
-# FILES AND SAFE BOOT
+# PERSISTENT FILE NAMES
 # ==================================================
 
 SETTINGS_FILENAME = "lab_panel_settings.json"
+SETTINGS_TEMP_FILENAME = "lab_panel_settings.tmp"
+
+
+# ==================================================
+# SAFE BOOT
+# ==================================================
 
 SAFE_BOOT_GPIO = 15
 
 
 # ==================================================
-# I2C AND OLED SETTINGS
+# MAIN I2C BUS
+#
+# GP16 = SDA0
+# GP17 = SCL0
+#
+# Devices:
+# - Main OLED at 0x3C
+# - MCP23017 #1 at 0x20
+# - MCP23017 #2 at 0x21
+# - Future meter / temperature sensor
+# ==================================================
+
+MAIN_I2C_SDA_GPIO = 16
+MAIN_I2C_SCL_GPIO = 17
+
+MAIN_OLED_ADDRESS = 0x3C
+
+MCP_1_ADDRESS = 0x20
+MCP_2_ADDRESS = 0x21
+MCP_3_ADDRESS = 0x22
+
+INA226_ADDRESS = 0x40
+TEMPERATURE_SENSOR_ADDRESS = 0x48
+
+
+# ==================================================
+# AUXILIARY I2C BUS
+#
+# GP26 = SDA1
+# GP27 = SCL1
+#
+# TCA9548A at 0x70
+# Channel 0 = encoder 1 OLED
+# Channel 1 = encoder 2 OLED
+# Channel 2 = encoder 3 OLED
+# Channel 3 = encoder 4 OLED
+# Channel 4 = encoder 5 OLED
+# Channel 5 = encoder 6 OLED
+# ==================================================
+
+AUX_I2C_SDA_GPIO = 26
+AUX_I2C_SCL_GPIO = 27
+
+TCA9548A_ADDRESS = 0x70
+SMALL_OLED_ADDRESS = 0x3C
+
+
+# ==================================================
+# OLED DIMENSIONS
 # ==================================================
 
 DISPLAY_WIDTH = 128
@@ -56,37 +115,9 @@ DISPLAY_HEIGHT = 64
 SMALL_DISPLAY_WIDTH = 128
 SMALL_DISPLAY_HEIGHT = 32
 
-# I2C0:
-# GP16 = SDA
-# GP17 = SCL
-MAIN_I2C_SDA_GPIO = 16
-MAIN_I2C_SCL_GPIO = 17
-
-# I2C1:
-# GP26 = SDA
-# GP27 = SCL
-AUX_I2C_SDA_GPIO = 26
-AUX_I2C_SCL_GPIO = 27
-
-MAIN_OLED_ADDRESS = 0x3C
-SMALL_OLED_ADDRESS = 0x3C
-TCA9548A_ADDRESS = 0x70
-
-MCP_1_ADDRESS = 0x20
-MCP_2_ADDRESS = 0x21
-MCP_3_ADDRESS = 0x22
-
 
 # ==================================================
-# OPTIONAL / FUTURE HARDWARE I2C ADDRESSES
-# ==================================================
-
-INA226_ADDRESS = 0x40
-TEMPERATURE_SENSOR_ADDRESS = 0x48
-
-
-# ==================================================
-# HARDWARE FEATURE FLAGS
+# HARDWARE FEATURES
 # ==================================================
 
 ENABLE_ENCODER_DISPLAYS = True
@@ -118,15 +149,60 @@ ENCODER_6 = 5
 
 
 # ==================================================
-# TIMING / BUTTON SETTINGS
+# MCP23017 REGISTER ADDRESSES
+#
+# Default BANK=0 mapping.
+# ==================================================
+
+MCP_IODIRA = 0x00
+MCP_IODIRB = 0x01
+
+MCP_GPPUA = 0x0C
+MCP_GPPUB = 0x0D
+
+MCP_GPIOA = 0x12
+MCP_GPIOB = 0x13
+
+MCP_OLATA = 0x14
+MCP_OLATB = 0x15
+
+
+# ==================================================
+# MCP #2 PORT B MAP
+#
+# GPB0 = relay output, reserved
+# GPB1 = relay output, reserved
+# GPB2 = left-door sensor input
+# GPB3 = right-door sensor input
+# GPB4-GPB7 = remaining spare I/O
+#
+# Active-low input scheme:
+# LOW  = door closed / switch pressed
+# HIGH = door open / wire fault / no switch contact
+# ==================================================
+
+LEFT_DOOR_BIT = 2
+RIGHT_DOOR_BIT = 3
+
+LEFT_DOOR_MASK = 1 << LEFT_DOOR_BIT
+RIGHT_DOOR_MASK = 1 << RIGHT_DOOR_BIT
+
+DOOR_INPUT_MASK = (
+    LEFT_DOOR_MASK |
+    RIGHT_DOOR_MASK
+)
+
+
+# ==================================================
+# TIMING
 # ==================================================
 
 ZERO_ALL_HOLD_MS = 1200
-BUTTON_DEBOUNCE_MS = 35
+BUTTON_DEBOUNCE_MS = 25
 
-# A short delay after a rotary detent reduces accidental
-# multiple UI redraws from bounce without slowing rotation.
-ENCODER_EVENT_GUARD_MS = 5
+# Fast encoder event guard. Keep small for responsive
+# input while filtering duplicate bounce events.
+ENCODER_EVENT_GUARD_MS = 2
 
 
 # ==================================================
@@ -143,47 +219,7 @@ ACTUATOR_PWM_FREQUENCY_HZ = 20000
 
 
 # ==================================================
-# MCP23017 REGISTER ADDRESSES
-#
-# Assumes default BANK = 0 register mapping.
-# ==================================================
-
-MCP_IODIRA = 0x00
-MCP_IODIRB = 0x01
-MCP_GPPUA = 0x0C
-MCP_GPPUB = 0x0D
-MCP_GPIOA = 0x12
-MCP_GPIOB = 0x13
-MCP_OLATA = 0x14
-MCP_OLATB = 0x15
-
-
-# ==================================================
-# MCP23017 #2 PORT B DOOR INPUT MAP
-#
-# GPB0 = left door sensor
-# GPB1 = right door sensor
-# GPB2-GPB7 = still available for future inputs
-#
-# Input logic with internal pull-ups:
-# HIGH = no switch contact to GND
-# LOW  = switch/sensor pulls pin to GND
-# ==================================================
-
-LEFT_DOOR_BIT = 0
-RIGHT_DOOR_BIT = 1
-
-LEFT_DOOR_MASK = 1 << LEFT_DOOR_BIT
-RIGHT_DOOR_MASK = 1 << RIGHT_DOOR_BIT
-
-DOOR_INPUT_MASK = (
-    LEFT_DOOR_MASK |
-    RIGHT_DOOR_MASK
-)
-
-
-# ==================================================
-# PAGE DEFINITIONS
+# APPLICATION PAGES
 # ==================================================
 
 PAGE_DECADE_BOX = 0
@@ -308,48 +344,47 @@ SENSOR_MODE_NAMES = (
 
 
 # ==================================================
-# SETTINGS PAGES
-#
-# The normal settings page contains configuration.
-# The Tests submenu contains all test functions.
+# SETTINGS VIEWS
 # ==================================================
 
 SETTINGS_VIEW_CONFIG = 0
 SETTINGS_VIEW_TESTS = 1
 
-SETTINGS_VIEW_NAMES = (
-    "CONFIG",
-    "TESTS"
-)
-
 
 # ==================================================
-# CONFIGURATION SETTINGS ITEMS
+# SETTINGS CONFIGURATION ITEMS
+#
+# Encoder 6 scrolls through the entries.
+# Encoder 2 adjusts the selected value.
+# Encoder 2 button saves.
 # ==================================================
 
 SETTINGS_RELAY_DELAY = 0
 SETTINGS_LED_PORTS = 1
 SETTINGS_LED_PIXELS = 2
 SETTINGS_LED_BRIGHTNESS = 3
-SETTINGS_FAN_LOW = 4
-SETTINGS_FAN_MEDIUM = 5
-SETTINGS_FAN_MANUAL = 6
-SETTINGS_FAN_START = 7
-SETTINGS_FAN_FULL = 8
-SETTINGS_FAN_RAMP_STEP = 9
-SETTINGS_FAN_RAMP_TIME = 10
-SETTINGS_METER_REFRESH = 11
-SETTINGS_BOOT_SCREEN_TIME = 12
-SETTINGS_POST_SCREEN_TIME = 13
-SETTINGS_AUX_OLEDS = 14
-SETTINGS_I2C_DEBUG = 15
-SETTINGS_OPEN_TESTS = 16
+SETTINGS_MAIN_OLED_BRIGHTNESS = 4
+SETTINGS_AUX_OLED_BRIGHTNESS = 5
+SETTINGS_FAN_LOW = 6
+SETTINGS_FAN_MEDIUM = 7
+SETTINGS_FAN_MANUAL = 8
+SETTINGS_FAN_START = 9
+SETTINGS_FAN_FULL = 10
+SETTINGS_FAN_RAMP_STEP = 11
+SETTINGS_FAN_RAMP_TIME = 12
+SETTINGS_METER_REFRESH = 13
+SETTINGS_BOOT_SCREEN_TIME = 14
+SETTINGS_POST_SCREEN_TIME = 15
+SETTINGS_I2C_DEBUG = 16
+SETTINGS_OPEN_TESTS = 17
 
 SETTINGS_ITEM_NAMES = (
     "RELAY DELAY",
     "LED PORTS",
     "LED PIXELS",
     "LED BRIGHT",
+    "MAIN OLED BRI",
+    "AUX OLED BRI",
     "FAN LOW",
     "FAN MEDIUM",
     "FAN MANUAL",
@@ -360,41 +395,44 @@ SETTINGS_ITEM_NAMES = (
     "METER RATE",
     "BOOT SCREEN",
     "POST SCREEN",
-    "AUX OLEDS",
     "I2C DEBUG",
     "OPEN TESTS"
 )
 
-NUMBER_OF_SETTINGS_ITEMS = len(SETTINGS_ITEM_NAMES)
+NUMBER_OF_SETTINGS_ITEMS = len(
+    SETTINGS_ITEM_NAMES
+)
 
 
 # ==================================================
-# TEST SETTINGS ITEMS
-#
-# More than two test functions are grouped here.
+# SETTINGS TEST SUBMENU
 # ==================================================
 
 TEST_RELAY_ALL_ON = 0
-TEST_RELAY_ALL_OFF = 1
-TEST_DISPLAY_TEST = 2
-TEST_DOOR_INPUTS = 3
-TEST_I2C_SCAN = 4
-TEST_RETURN_CONFIG = 5
+TEST_RELAY_STOP = 1
+TEST_MAIN_OLED = 2
+TEST_AUX_OLEDS = 3
+TEST_DOOR_INPUTS = 4
+TEST_I2C_SCAN = 5
+TEST_RETURN_CONFIG = 6
 
 TEST_ITEM_NAMES = (
     "RELAYS ALL ON",
-    "RELAYS ALL OFF",
-    "DISPLAY TEST",
+    "STOP RELAY TEST",
+    "MAIN OLED TEST",
+    "AUX OLED TEST",
     "DOOR INPUT TEST",
     "I2C SCAN",
     "RETURN CONFIG"
 )
 
-NUMBER_OF_TEST_ITEMS = len(TEST_ITEM_NAMES)
+NUMBER_OF_TEST_ITEMS = len(
+    TEST_ITEM_NAMES
+)
 
 
 # ==================================================
-# GENERAL HELPERS
+# GENERAL HELPER FUNCTIONS
 # ==================================================
 
 def clamp(value, minimum, maximum):
@@ -423,24 +461,25 @@ def percent_to_duty_u16(percent):
 
 
 def text_center_x(text, scale=1):
-    text_width = len(text) * 8 * scale
-    return (DISPLAY_WIDTH - text_width) // 2
+    return (
+        DISPLAY_WIDTH -
+        len(text) * 8 * scale
+    ) // 2
 
 
 def small_text_center_x(text):
-    text_width = len(text) * 8
-    return (SMALL_DISPLAY_WIDTH - text_width) // 2
+    return (
+        SMALL_DISPLAY_WIDTH -
+        len(text) * 8
+    ) // 2
 
 
-def short_text(text, maximum_length=16):
-    return text[:maximum_length]
+def short_text(text, maximum=16):
+    return text[:maximum]
 
 
 # ==================================================
 # PERSISTENT SETTINGS
-#
-# Saved to the Pico flash filesystem. This file
-# persists over normal reset/power cycles.
 # ==================================================
 
 DEFAULT_SETTINGS = {
@@ -455,6 +494,9 @@ DEFAULT_SETTINGS = {
     "custom_blue": 0,
     "custom_white": 0,
 
+    "main_oled_brightness": 180,
+    "aux_oled_brightness": 180,
+
     "fan_low_percent": 25,
     "fan_medium_percent": 55,
     "fan_manual_percent": 50,
@@ -468,16 +510,15 @@ DEFAULT_SETTINGS = {
     "boot_screen_ms": 1500,
     "post_screen_ms": 1500,
 
-    "encoder_displays_enabled": True,
     "i2c_debug": False
 }
 
 
 def load_settings():
-    loaded_settings = {}
+    loaded = {}
 
     for key in DEFAULT_SETTINGS:
-        loaded_settings[key] = DEFAULT_SETTINGS[key]
+        loaded[key] = DEFAULT_SETTINGS[key]
 
     try:
         file_handle = open(
@@ -485,19 +526,29 @@ def load_settings():
             "r"
         )
 
-        stored_settings = json.load(file_handle)
+        file_data = json.load(file_handle)
         file_handle.close()
 
         for key in DEFAULT_SETTINGS:
-            if key in stored_settings:
-                loaded_settings[key] = stored_settings[key]
+            if key in file_data:
+                loaded[key] = file_data[key]
 
-        print("Settings file found and applied")
-        return loaded_settings, True
+        print("Saved settings applied")
+        return loaded, True
 
     except Exception as error:
-        print("No usable settings file:", error)
-        return loaded_settings, False
+        print("No saved settings:", error)
+        return loaded, False
+
+
+def delete_file_if_present(filename):
+    if os is None:
+        return
+
+    try:
+        os.remove(filename)
+    except OSError:
+        pass
 
 
 def save_settings_file():
@@ -505,82 +556,158 @@ def save_settings_file():
     global settings_message
 
     try:
-        file_handle = open(
-            SETTINGS_FILENAME,
+        delete_file_if_present(
+            SETTINGS_TEMP_FILENAME
+        )
+
+        temporary_file = open(
+            SETTINGS_TEMP_FILENAME,
             "w"
         )
 
-        json.dump(settings, file_handle)
-        file_handle.close()
+        json.dump(settings, temporary_file)
+        temporary_file.close()
 
-        settings_unsaved = False
-        settings_message = "SAVED"
+        # Verify temporary JSON before replacing active file.
+        verify_file = open(
+            SETTINGS_TEMP_FILENAME,
+            "r"
+        )
 
-        print("Settings saved successfully")
+        verified_data = json.load(verify_file)
+        verify_file.close()
 
-        # Re-open and parse the file to confirm that it
-        # was actually written and is readable.
-        verify_handle = open(
+        if "relay_delay_ms" not in verified_data:
+            raise Exception("settings verify failed")
+
+        delete_file_if_present(SETTINGS_FILENAME)
+
+        if os is not None:
+            os.rename(
+                SETTINGS_TEMP_FILENAME,
+                SETTINGS_FILENAME
+            )
+        else:
+            # Fallback for unusual MicroPython builds.
+            final_file = open(
+                SETTINGS_FILENAME,
+                "w"
+            )
+
+            json.dump(verified_data, final_file)
+            final_file.close()
+
+            delete_file_if_present(
+                SETTINGS_TEMP_FILENAME
+            )
+
+        # Final verification after rename.
+        final_verify_file = open(
             SETTINGS_FILENAME,
             "r"
         )
 
-        verify_data = json.load(verify_handle)
-        verify_handle.close()
+        final_verify_data = json.load(
+            final_verify_file
+        )
 
-        if "relay_delay_ms" in verify_data:
-            print("Settings save verified")
-        else:
-            settings_message = "SAVE VERIFY ERR"
-            print("Settings verification failed")
+        final_verify_file.close()
+
+        if "relay_delay_ms" not in final_verify_data:
+            raise Exception("final verify failed")
+
+        settings_unsaved = False
+        settings_message = "SAVED"
+
+        print("Settings saved and verified")
 
     except Exception as error:
         settings_message = "SAVE ERROR"
         print("Settings save error:", error)
 
 
-settings, settings_file_was_loaded = load_settings()
+settings, settings_found = load_settings()
 
-# Blank when saved settings load normally.
-settings_message = ""
-
-# Human-readable replacement for "DIRTY".
 settings_unsaved = False
+settings_message = ""
 
 
 # ==================================================
 # ACTIVE SETTINGS VARIABLES
 # ==================================================
 
-RELAY_SETTLE_DELAY_MS = settings["relay_delay_ms"]
+RELAY_SETTLE_DELAY_MS = settings[
+    "relay_delay_ms"
+]
 
-LED_PORT_COUNT = settings["led_port_count"]
-LED_PIXELS_PER_PORT = settings["led_pixels_per_port"]
-lighting_brightness = settings["led_brightness"]
+LED_PORT_COUNT = settings[
+    "led_port_count"
+]
+
+LED_PIXELS_PER_PORT = settings[
+    "led_pixels_per_port"
+]
+
+lighting_brightness = settings[
+    "led_brightness"
+]
 
 custom_red = settings["custom_red"]
 custom_green = settings["custom_green"]
 custom_blue = settings["custom_blue"]
 custom_white = settings["custom_white"]
 
-fan_low_percent = settings["fan_low_percent"]
-fan_medium_percent = settings["fan_medium_percent"]
-fan_manual_percent = settings["fan_manual_percent"]
-fan_auto_start_c = settings["fan_auto_start_c"]
-fan_auto_full_c = settings["fan_auto_full_c"]
-fan_ramp_step_percent = settings["fan_ramp_step_percent"]
-fan_ramp_interval_ms = settings["fan_ramp_interval_ms"]
-
-meter_refresh_ms = settings["meter_refresh_ms"]
-
-boot_screen_ms = settings["boot_screen_ms"]
-post_screen_ms = settings["post_screen_ms"]
-
-ENABLE_ENCODER_DISPLAYS = settings[
-    "encoder_displays_enabled"
+main_oled_brightness = settings[
+    "main_oled_brightness"
 ]
 
-i2c_debug_enabled = settings["i2c_debug"]
+aux_oled_brightness = settings[
+    "aux_oled_brightness"
+]
+
+fan_low_percent = settings[
+    "fan_low_percent"
+]
+
+fan_medium_percent = settings[
+    "fan_medium_percent"
+]
+
+fan_manual_percent = settings[
+    "fan_manual_percent"
+]
+
+fan_auto_start_c = settings[
+    "fan_auto_start_c"
+]
+
+fan_auto_full_c = settings[
+    "fan_auto_full_c"
+]
+
+fan_ramp_step_percent = settings[
+    "fan_ramp_step_percent"
+]
+
+fan_ramp_interval_ms = settings[
+    "fan_ramp_interval_ms"
+]
+
+meter_refresh_ms = settings[
+    "meter_refresh_ms"
+]
+
+boot_screen_ms = settings[
+    "boot_screen_ms"
+]
+
+post_screen_ms = settings[
+    "post_screen_ms"
+]
+
+i2c_debug_enabled = settings[
+    "i2c_debug"
+]
 
 
 def mark_settings_unsaved():
@@ -592,33 +719,66 @@ def mark_settings_unsaved():
 
 
 def copy_runtime_settings_to_dictionary():
-    settings["relay_delay_ms"] = RELAY_SETTLE_DELAY_MS
+    settings["relay_delay_ms"] = (
+        RELAY_SETTLE_DELAY_MS
+    )
 
     settings["led_port_count"] = LED_PORT_COUNT
-    settings["led_pixels_per_port"] = LED_PIXELS_PER_PORT
-    settings["led_brightness"] = lighting_brightness
+    settings["led_pixels_per_port"] = (
+        LED_PIXELS_PER_PORT
+    )
+
+    settings["led_brightness"] = (
+        lighting_brightness
+    )
 
     settings["custom_red"] = custom_red
     settings["custom_green"] = custom_green
     settings["custom_blue"] = custom_blue
     settings["custom_white"] = custom_white
 
-    settings["fan_low_percent"] = fan_low_percent
-    settings["fan_medium_percent"] = fan_medium_percent
-    settings["fan_manual_percent"] = fan_manual_percent
-    settings["fan_auto_start_c"] = fan_auto_start_c
-    settings["fan_auto_full_c"] = fan_auto_full_c
-    settings["fan_ramp_step_percent"] = fan_ramp_step_percent
-    settings["fan_ramp_interval_ms"] = fan_ramp_interval_ms
+    settings["main_oled_brightness"] = (
+        main_oled_brightness
+    )
 
-    settings["meter_refresh_ms"] = meter_refresh_ms
+    settings["aux_oled_brightness"] = (
+        aux_oled_brightness
+    )
+
+    settings["fan_low_percent"] = (
+        fan_low_percent
+    )
+
+    settings["fan_medium_percent"] = (
+        fan_medium_percent
+    )
+
+    settings["fan_manual_percent"] = (
+        fan_manual_percent
+    )
+
+    settings["fan_auto_start_c"] = (
+        fan_auto_start_c
+    )
+
+    settings["fan_auto_full_c"] = (
+        fan_auto_full_c
+    )
+
+    settings["fan_ramp_step_percent"] = (
+        fan_ramp_step_percent
+    )
+
+    settings["fan_ramp_interval_ms"] = (
+        fan_ramp_interval_ms
+    )
+
+    settings["meter_refresh_ms"] = (
+        meter_refresh_ms
+    )
 
     settings["boot_screen_ms"] = boot_screen_ms
     settings["post_screen_ms"] = post_screen_ms
-
-    settings[
-        "encoder_displays_enabled"
-    ] = ENABLE_ENCODER_DISPLAYS
 
     settings["i2c_debug"] = i2c_debug_enabled
 
@@ -648,7 +808,7 @@ i2c_aux = I2C(
 
 
 # ==================================================
-# MAIN OLED INITIALIZATION
+# MAIN OLED
 # ==================================================
 
 display = SSD1306_I2C(
@@ -660,7 +820,7 @@ display = SSD1306_I2C(
 
 
 # ==================================================
-# SAFE BOOT INPUT
+# SAFE BOOT PIN
 # ==================================================
 
 safe_boot_pin = Pin(
@@ -678,7 +838,7 @@ safe_boot_requested = (
 # MCP23017 FUNCTIONS
 # ==================================================
 
-def def mcp_write_register(address, register, value):
+def mcp_write_register(address, register, value):
     try:
         i2c_main.writeto_mem(
             address,
@@ -688,23 +848,10 @@ def def mcp_write_register(address, register, value):
         return True
     except OSError as error:
         print("MCP write failed:", hex(address), error)
-        return False(address, register, value):
-    i2c_main.writeto_mem(
-        address,
-        register,
-        bytes([value & 0xFF])
-    )
+        return False
 
 
-def 
 def mcp_read_register(address, register):
-    result = i2c_main.readfrom_mem(
-        address,
-        register,
-        1
-    )
-
-    return result[0](address, register):
     result = i2c_main.readfrom_mem(
         address,
         register,
@@ -713,157 +860,62 @@ def mcp_read_register(address, register):
 
     return result[0]
 
-
-def mcp_setup_relay_outputs():
-    # MCP #1: every pin is an output.
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+def mcp_setup_devices():
+    # MCP #1: all sixteen pins are relay outputs.
+    mcp_write_register(
         MCP_1_ADDRESS,
         MCP_IODIRA,
         0x00
     )
 
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         MCP_1_ADDRESS,
         MCP_IODIRB,
         0x00
     )
 
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         MCP_1_ADDRESS,
         MCP_OLATA,
         0x00
     )
 
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         MCP_1_ADDRESS,
         MCP_OLATB,
         0x00
     )
 
-    # MCP #2:
-    # Port A = relay outputs.
-    # Port B:
-    # GPB0 and GPB1 = door inputs.
-    # GPB2-GPB7 = outputs/reserved.
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    # MCP #2 Port A: all relay outputs.
+    mcp_write_register(
         MCP_2_ADDRESS,
         MCP_IODIRA,
         0x00
     )
 
-    # 1 = input for door bits.
-    # 0 = output for remaining Port B bits.
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    # MCP #2 Port B:
+    # GPB2 and GPB3 are door inputs.
+    # Remaining bits are outputs/reserved.
+    mcp_write_register(
         MCP_2_ADDRESS,
         MCP_IODIRB,
         DOOR_INPUT_MASK
     )
 
-    # Enable weak internal pull-ups on GPB0/GPB1.
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    # Internal pull-ups enabled for GPB2/GPB3.
+    mcp_write_register(
         MCP_2_ADDRESS,
         MCP_GPPUB,
         DOOR_INPUT_MASK
     )
 
-    # Start MCP #2 outputs low.
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         MCP_2_ADDRESS,
         MCP_OLATA,
         0x00
     )
 
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         MCP_2_ADDRESS,
         MCP_OLATB,
         0x00
@@ -871,84 +923,49 @@ def mcp_setup_relay_outputs():
 
 
 def mcp_write_16_outputs(address, output_word):
-    port_a_value = output_word & 0xFF
-    port_b_value = (output_word >> 8) & 0xFF
-
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         address,
         MCP_OLATA,
-        port_a_value
+        output_word & 0xFF
     )
 
-    def mcp_write_register(address, register, value):
-    try:
-        i2c_main.writeto_mem(
-            address,
-            register,
-            bytes([value & 0xFF])
-        )
-        return True
-    except OSError as error:
-        print("MCP write failed:", hex(address), error)
-        return False(
+    mcp_write_register(
         address,
         MCP_OLATB,
-        port_b_value
+        (output_word >> 8) & 0xFF
     )
 
 
 def read_door_inputs():
-    # With pull-ups:
-    # 0 = input grounded = active/open/fault
-    # 1 = input released = inactive
     try:
-        port_b_value = 
-def mcp_read_register(address, register):
-    result = i2c_main.readfrom_mem(
-        address,
-        register,
-        1
-    )
-
-    return result[0](
+        port_b_value = mcp_read_register(
             MCP_2_ADDRESS,
             MCP_GPIOB
         )
 
-        left_door_open = (
-            (port_b_value & LEFT_DOOR_MASK) == 0
+        # Active-low:
+        # Low = closed switch
+        # High = open door / no ground path
+        left_is_open = (
+            (port_b_value & LEFT_DOOR_MASK) != 0
         )
 
-        right_door_open = (
-            (port_b_value & RIGHT_DOOR_MASK) == 0
+        right_is_open = (
+            (port_b_value & RIGHT_DOOR_MASK) != 0
         )
 
-        return left_door_open, right_door_open
+        return left_is_open, right_is_open
 
     except OSError:
-        # Treat missing/failed input read as open/fault.
+        # Failed sensor read is treated as unsafe.
         return True, True
 
 
-# ==================================================
-# INITIALIZE MCP23017 DEVICES
-# ==================================================
-
-mcp_setup_relay_outputs()
+mcp_setup_devices()
 
 
 # ==================================================
-# ENCODER GPIO INITIALIZATION
+# ENCODER GPIO SETUP
 # ==================================================
 
 clk_pins = []
@@ -970,7 +987,7 @@ for i in range(NUMBER_OF_ENCODERS):
 
 
 # ==================================================
-# ENCODER DECODER STATE
+# ENCODER DECODER
 # ==================================================
 
 last_state = []
@@ -978,12 +995,12 @@ step_count = []
 last_encoder_event_time = []
 
 for i in range(NUMBER_OF_ENCODERS):
-    initial_state = (
+    current_state = (
         (clk_pins[i].value() << 1) |
         dt_pins[i].value()
     )
 
-    last_state.append(initial_state)
+    last_state.append(current_state)
     step_count.append(0)
     last_encoder_event_time.append(0)
 
@@ -1029,7 +1046,10 @@ def read_encoder_direction(encoder_number):
         ) < ENCODER_EVENT_GUARD_MS:
             return 0
 
-        last_encoder_event_time[encoder_number] = now
+        last_encoder_event_time[
+            encoder_number
+        ] = now
+
         return 1
 
     if step_count[encoder_number] <= -4:
@@ -1041,7 +1061,10 @@ def read_encoder_direction(encoder_number):
         ) < ENCODER_EVENT_GUARD_MS:
             return 0
 
-        last_encoder_event_time[encoder_number] = now
+        last_encoder_event_time[
+            encoder_number
+        ] = now
+
         return -1
 
     return 0
@@ -1118,7 +1141,7 @@ last_value_change_time = utime.ticks_ms()
 
 
 # ==================================================
-# LIVE METER STATE
+# METER STATE
 # ==================================================
 
 meter_view = METER_VIEW_CURRENT
@@ -1131,8 +1154,7 @@ measured_power_watts = 0.000
 # ==================================================
 # LIGHTING STATE
 #
-# Software reserves 12 logical RGBW ports/zones.
-# Actual hardware driver mapping is still future work.
+# 12 logical ports/zones are retained in the software.
 # ==================================================
 
 lighting_mode = LIGHT_OFF
@@ -1322,14 +1344,14 @@ def resistance_string():
 
 
 def current_string(current_amps):
-    absolute_current = abs(current_amps)
+    current_abs = abs(current_amps)
 
-    if absolute_current < 0.001:
+    if current_abs < 0.001:
         return "{:.1f}uA".format(
             current_amps * 1000000
         )
 
-    if absolute_current < 1.0:
+    if current_abs < 1.0:
         return "{:.1f}mA".format(
             current_amps * 1000
         )
@@ -1355,132 +1377,130 @@ def power_string(power_watts):
 
 
 # ==================================================
-# BOOT SCREEN AND POST
+# SSD1306 BRIGHTNESS CONTROL
+#
+# Contrast command = 0x81 followed by 0..255.
+# ==================================================
+
+def set_oled_brightness(oled, brightness):
+    brightness = clamp(brightness, 0, 255)
+
+    try:
+        oled.write_cmd(0x81)
+        oled.write_cmd(brightness)
+
+    except Exception as error:
+        if i2c_debug_enabled:
+            print("OLED contrast error:", error)
+
+
+def apply_main_oled_brightness():
+    set_oled_brightness(
+        display,
+        main_oled_brightness
+    )
+
+
+def apply_aux_oled_brightness():
+    if not ENABLE_ENCODER_DISPLAYS:
+        return
+
+    for channel_number in range(NUMBER_OF_ENCODERS):
+        oled = small_displays[channel_number]
+
+        if oled is None:
+            continue
+
+        if tca_select_channel(channel_number):
+            set_oled_brightness(
+                oled,
+                aux_oled_brightness
+            )
+
+    tca_disable_all_channels()
+
+
+# ==================================================
+# BOOT SCREEN / POST
 # ==================================================
 
 def draw_boot_screen():
     display.fill(0)
 
-    display.text(
-        "LAB CONTROL PANEL",
-        0,
-        8
-    )
-
-    display.text(
-        "DECADE RESISTOR",
-        0,
-        22
-    )
-
-    display.text(
-        "SYSTEM STARTING",
-        0,
-        44
-    )
+    display.text("LAB CONTROL", 20, 10)
+    display.text("PANEL", 44, 22)
+    display.text("STARTING", 32, 44)
 
     display.show()
 
 
 def draw_post_screen(
-    main_bus_ok,
-    aux_bus_ok,
+    main_oled_ok,
     mcp1_ok,
     mcp2_ok,
     tca_ok
 ):
     display.fill(0)
 
-    display.text("HARDWARE POST", 0, 0)
+    display.text("HARDWARE POST", 8, 0)
 
     display.text(
-        "I2C0 " +
-        ("OK" if main_bus_ok else "FAIL"),
+        "MAIN OLED " +
+        ("OK" if main_oled_ok else "FAIL"),
         0,
-        14
+        15
     )
 
     display.text(
-        "I2C1 " +
-        ("OK" if aux_bus_ok else "FAIL"),
-        0,
-        25
-    )
-
-    display.text(
-        "MCP1 " +
+        "MCP #1 " +
         ("OK" if mcp1_ok else "FAIL"),
         0,
-        36
+        27
     )
 
     display.text(
-        "MCP2 " +
+        "MCP #2 " +
         ("OK" if mcp2_ok else "FAIL"),
-        64,
-        36
+        0,
+        39
     )
 
     display.text(
-        "TCA " +
+        "AUX TCA " +
         ("OK" if tca_ok else "FAIL"),
         0,
-        47
+        51
     )
 
     display.show()
 
 
 def run_hardware_post():
-    main_scan = []
-    aux_scan = []
-
     try:
         main_scan = i2c_main.scan()
     except OSError:
-        pass
+        main_scan = []
 
     try:
         aux_scan = i2c_aux.scan()
     except OSError:
-        pass
-
-    main_bus_ok = (
-        MAIN_OLED_ADDRESS in main_scan
-    )
-
-    aux_bus_ok = (
-        TCA9548A_ADDRESS in aux_scan
-    )
-
-    mcp1_ok = (
-        MCP_1_ADDRESS in main_scan
-    )
-
-    mcp2_ok = (
-        MCP_2_ADDRESS in main_scan
-    )
-
-    tca_ok = aux_bus_ok
+        aux_scan = []
 
     print("POST I2C0:", main_scan)
     print("POST I2C1:", aux_scan)
 
     return (
-        main_bus_ok,
-        aux_bus_ok,
-        mcp1_ok,
-        mcp2_ok,
-        tca_ok
+        MAIN_OLED_ADDRESS in main_scan,
+        MCP_1_ADDRESS in main_scan,
+        MCP_2_ADDRESS in main_scan,
+        TCA9548A_ADDRESS in aux_scan
     )
 
 
 # ==================================================
-# MAIN OLED DISPLAY
+# MAIN OLED DRAWING
 #
-# Main display remains clean:
-# large values, broad status, and no dense control text.
-# Detailed control instructions stay on small OLEDs.
+# Fine control descriptions remain on small OLEDs.
 # ==================================================
 
 def draw_header(title):
@@ -1554,25 +1574,29 @@ def draw_decade_box_page():
 
     value_text = resistance_string()
 
+    # Correct centered layout:
+    # 0 through 999,999 can use 2x scaling.
     if not extra_one_meg_enabled:
-        value_x = text_center_x(value_text, 2)
+        text_x = text_center_x(value_text, 2)
 
         big_text(
             display,
             value_text,
-            value_x,
-            28,
+            text_x,
+            24,
             2
         )
 
+    # 1,000,000 through 1,999,999:
+    # one horizontal scale, two vertical scale.
     else:
-        value_x = text_center_x(value_text, 1)
+        text_x = text_center_x(value_text, 1)
 
         big_text_stretched(
             display,
             value_text,
-            value_x,
-            28,
+            text_x,
+            24,
             1,
             2
         )
@@ -1707,7 +1731,7 @@ def draw_actuator_page():
 
 
 def draw_sensors_page():
-    draw_header("TOOL SENSORS")
+    draw_header("SENSORS")
 
     display.text(
         "LEFT " +
@@ -1770,6 +1794,20 @@ def draw_settings_page():
             37
         )
 
+        if settings_unsaved:
+            display.text(
+                "UNSAVED SETTINGS",
+                0,
+                52
+            )
+
+        elif settings_message != "":
+            display.text(
+                settings_message,
+                0,
+                52
+            )
+
     else:
         draw_header("SETTINGS TESTS")
 
@@ -1785,7 +1823,7 @@ def draw_settings_page():
             display.text(
                 "RELAYS ACTIVE",
                 0,
-                48
+                52
             )
 
 
@@ -1820,14 +1858,7 @@ def update_main_display():
 
 
 # ==================================================
-# TCA9548A / SMALL OLED FUNCTIONS
-#
-# Channel 0 = encoder 1 display
-# Channel 1 = encoder 2 display
-# Channel 2 = encoder 3 display
-# Channel 3 = encoder 4 display
-# Channel 4 = encoder 5 display
-# Channel 5 = encoder 6 display
+# TCA9548A / SMALL OLED SETUP
 # ==================================================
 
 def tca_select_channel(channel_number):
@@ -1845,7 +1876,7 @@ def tca_select_channel(channel_number):
     except OSError as error:
         if i2c_debug_enabled:
             print(
-                "TCA channel error:",
+                "TCA select error:",
                 channel_number,
                 error
             )
@@ -1864,39 +1895,71 @@ def tca_disable_all_channels():
         pass
 
 
-def create_small_oled(channel_number):
-    if not tca_select_channel(channel_number):
-        return None
+# One persistent display object per TCA channel.
+# This prevents repeated initialization lag.
+small_displays = [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None
+]
 
-    try:
-        return SSD1306_I2C(
-            SMALL_DISPLAY_WIDTH,
-            SMALL_DISPLAY_HEIGHT,
-            i2c_aux,
-            addr=SMALL_OLED_ADDRESS
-        )
 
-    except OSError as error:
-        if i2c_debug_enabled:
-            print(
-                "Small OLED error:",
-                channel_number,
-                error
+def initialize_small_displays():
+    if not ENABLE_ENCODER_DISPLAYS:
+        return
+
+    for channel_number in range(NUMBER_OF_ENCODERS):
+        if not tca_select_channel(channel_number):
+            continue
+
+        try:
+            small_displays[channel_number] = (
+                SSD1306_I2C(
+                    SMALL_DISPLAY_WIDTH,
+                    SMALL_DISPLAY_HEIGHT,
+                    i2c_aux,
+                    addr=SMALL_OLED_ADDRESS
+                )
             )
 
-        return None
+            set_oled_brightness(
+                small_displays[channel_number],
+                aux_oled_brightness
+            )
 
+        except OSError as error:
+            small_displays[channel_number] = None
+
+            if i2c_debug_enabled:
+                print(
+                    "Small OLED init error:",
+                    channel_number,
+                    error
+                )
+
+    tca_disable_all_channels()
+
+
+# ==================================================
+# SMALL DISPLAY CONTENT
+#
+# Every entry:
+# (top_line, middle_line, bottom_line, highlight_line)
+#
+# highlight_line:
+# 0 = none
+# 1 = top
+# 2 = middle
+# 3 = bottom
+#
+# Empty controls stay truly blank.
+# ==================================================
 
 def small_display_content():
-    # Every element is:
-    #
-    # (top_line, middle_line, bottom_line)
-    #
-    # The 128x32 screen has four 8-pixel rows. All text
-    # is centered to use space more cleanly and avoid
-    # the earlier top-left clustered appearance.
-
-    blank = ("", "", "")
+    blank = ("", "", "", 0)
 
     if menu_browser_active:
         return (
@@ -1904,8 +1967,18 @@ def small_display_content():
             blank,
             blank,
             blank,
-            ("MENU BACK", "PRESS", ""),
-            ("MENU SCROLL", "PRESS = OPEN", "")
+            (
+                "MENU",
+                "BUTTON",
+                "BACK",
+                2
+            ),
+            (
+                "MENU",
+                "TURN SCROLL",
+                "PRESS ENTER",
+                2
+            )
         )
 
     if active_page == PAGE_DECADE_BOX:
@@ -1914,32 +1987,38 @@ def small_display_content():
                 "100K = " + str(digits[0]),
                 "+1M " +
                 ("ON" if extra_one_meg_enabled else "OFF"),
-                "PRESS TOGGLE"
+                "PRESS TOGGLE",
+                2
             ),
             (
                 "10K = " + str(digits[1]),
                 "TURN",
-                ""
+                "",
+                1
             ),
             (
                 "1K = " + str(digits[2]),
                 "HOLD BUTTON",
-                "ZERO ALL"
+                "ZERO ALL",
+                2
             ),
             (
                 "100 = " + str(digits[3]),
                 "TURN",
-                ""
+                "",
+                1
             ),
             (
                 "10 = " + str(digits[4]),
-                "PRESS METERS",
-                ""
+                "PRESS",
+                "LIVE METERS",
+                2
             ),
             (
                 "1R = " + str(digits[5]),
-                "PRESS MENU",
-                ""
+                "PRESS",
+                "MENU",
+                2
             )
         )
 
@@ -1949,19 +2028,22 @@ def small_display_content():
             (
                 METER_VIEW_NAMES[meter_view],
                 "TURN / PRESS",
-                "SELECT VIEW"
+                "SELECT VIEW",
+                2
             ),
             blank,
             blank,
             (
                 "PRESS",
                 "DECADE BOX",
-                ""
+                "",
+                2
             ),
             (
-                "PRESS MENU",
+                "PRESS",
+                "MENU",
                 "",
-                ""
+                2
             )
         )
 
@@ -1970,34 +2052,40 @@ def small_display_content():
             (
                 "MODE",
                 LIGHTING_MODE_NAMES[lighting_mode],
-                ""
+                "",
+                2
             ),
             (
                 "BRIGHTNESS",
                 str(lighting_brightness),
-                ""
+                "",
+                2
             ),
             (
                 "CUSTOM RED",
                 str(custom_red),
-                ""
+                "",
+                2
             ),
             (
                 "CUSTOM GREEN",
                 str(custom_green),
-                ""
+                "",
+                2
             ),
             (
                 "CUSTOM BLUE",
                 str(custom_blue),
-                ""
+                "",
+                2
             ),
             (
                 "LED PORT",
                 str(lighting_selected_port + 1) +
                 "/" +
                 str(LED_PORT_COUNT),
-                "PRESS MENU"
+                "PRESS MENU",
+                2
             )
         )
 
@@ -2006,32 +2094,38 @@ def small_display_content():
             (
                 "FAN MODE",
                 FAN_MODE_NAMES[fan_mode],
-                ""
+                "",
+                2
             ),
             (
                 "LOW SPEED",
                 str(fan_low_percent) + "%",
-                ""
+                "",
+                2
             ),
             (
                 "MID SPEED",
                 str(fan_medium_percent) + "%",
-                ""
+                "",
+                2
             ),
             (
                 "AUTO START",
                 str(fan_auto_start_c) + "C",
-                ""
+                "",
+                2
             ),
             (
                 "AUTO FULL",
                 str(fan_auto_full_c) + "C",
-                ""
+                "",
+                2
             ),
             (
-                "MENU",
                 "PRESS",
-                ""
+                "MENU",
+                "",
+                2
             )
         )
 
@@ -2040,28 +2134,33 @@ def small_display_content():
             (
                 "MOVE",
                 "EXT / RET",
-                ""
+                "",
+                2
             ),
             (
                 "SPEED",
                 str(actuator_speed_percent) + "%",
-                ""
+                "",
+                2
             ),
             (
                 "POSITION",
                 str(actuator_position_percent) + "%",
-                ""
+                "",
+                2
             ),
             (
                 "ENABLE",
                 "ON" if actuator_enabled else "OFF",
-                ""
+                "",
+                2
             ),
             blank,
             (
-                "MENU",
                 "PRESS",
-                ""
+                "MENU",
+                "",
+                2
             )
         )
 
@@ -2070,167 +2169,206 @@ def small_display_content():
             (
                 "TOOL SELECT",
                 "T" + str(selected_tool + 1),
-                ""
+                "",
+                2
             ),
             (
                 "SENSOR MODE",
                 SENSOR_MODE_NAMES[sensor_mode],
-                ""
+                "",
+                2
             ),
             (
                 "LEFT DOOR",
                 "OPEN" if left_door_open else "CLOSED",
-                ""
+                "",
+                2
             ),
             (
                 "RIGHT DOOR",
                 "OPEN" if right_door_open else "CLOSED",
-                ""
+                "",
+                2
             ),
             blank,
             (
-                "MENU",
                 "PRESS",
-                ""
+                "MENU",
+                "",
+                2
             )
         )
 
     # SETTINGS PAGE
     if settings_view == SETTINGS_VIEW_CONFIG:
+        test_line = ""
+
+        if settings_selected_item == SETTINGS_OPEN_TESTS:
+            test_line = "PRESS BUTTON 4"
+
         return (
             (
-                "SELECT SETTING",
-                SETTINGS_ITEM_NAMES[
-                    settings_selected_item
-                ],
-                ""
+                "SETTINGS",
+                "TURN SELECT",
+                "",
+                2
             ),
             (
                 "EDIT VALUE",
                 settings_value_string(),
-                "PRESS TO SAVE"
+                "PRESS SAVE",
+                2
             ),
             blank,
             (
                 "TESTS",
-                "PRESS TO OPEN",
-                ""
+                test_line,
+                "",
+                2 if test_line != "" else 0
             ),
             blank,
             (
-                "MENU",
                 "PRESS",
-                ""
+                "MENU",
+                "",
+                2
             )
         )
 
-    # SETTINGS TEST SUBMENU
+    # SETTINGS TEST VIEW
+    test_action_text = "RUN TEST"
+
+    if (
+        relay_test_active and
+        test_selected_item == TEST_RELAY_ALL_ON
+    ):
+        test_action_text = "STOP TEST"
+
     return (
         (
             "SELECT TEST",
-            TEST_ITEM_NAMES[
-                test_selected_item
-            ],
-            ""
+            TEST_ITEM_NAMES[test_selected_item],
+            "",
+            2
         ),
         (
-            "PRESS",
-            "RUN TEST",
-            ""
+            "PRESS BUTTON",
+            test_action_text,
+            "",
+            2
         ),
         blank,
         (
-            "DOOR TEST",
+            "DOOR STATE",
             "SEE MAIN OLED",
-            ""
+            "",
+            2
         ),
         (
-            "RETURN",
+            "RETURN CONFIG",
+            "SELECT ABOVE",
+            "",
+            2
+        ),
+        (
             "PRESS",
-            ""
-        ),
-        (
             "MENU",
-            "PRESS",
-            ""
+            "",
+            2
         )
     )
 
 
-def draw_centered_small_display(
+def draw_small_oled(
     oled,
-    line_1,
-    line_2,
-    line_3
+    top_line,
+    middle_line,
+    bottom_line,
+    highlight_line
 ):
+    # A 128x32 display has four 8-pixel text rows.
+    # Three centered text rows use most of its physical
+    # area while retaining clean spacing.
     oled.fill(0)
 
-    if line_1 != "":
-        oled.text(
-            short_text(line_1),
-            small_text_center_x(
-                short_text(line_1)
-            ),
-            0
-        )
+    lines = (
+        (top_line, 0, 1),
+        (middle_line, 11, 2),
+        (bottom_line, 22, 3)
+    )
 
-    if line_2 != "":
-        oled.text(
-            short_text(line_2),
-            small_text_center_x(
-                short_text(line_2)
-            ),
-            10
-        )
+    for text, y_position, line_number in lines:
+        if text == "":
+            continue
 
-    if line_3 != "":
-        oled.text(
-            short_text(line_3),
-            small_text_center_x(
-                short_text(line_3)
-            ),
-            21
-        )
+        shown_text = short_text(text)
+        x_position = small_text_center_x(shown_text)
+
+        if highlight_line == line_number:
+            oled.fill_rect(
+                0,
+                y_position - 1,
+                SMALL_DISPLAY_WIDTH,
+                10,
+                1
+            )
+
+            oled.text(
+                shown_text,
+                x_position,
+                y_position,
+                0
+            )
+
+        else:
+            oled.text(
+                shown_text,
+                x_position,
+                y_position,
+                1
+            )
 
     oled.show()
 
 
 def update_small_displays():
-    # This function is called only when UI information
-    # changes. It is NOT called in the periodic sensor,
-    # meter, or fan refresh tasks, preventing flicker.
+    # Called only for a user-visible UI change.
+    # Never call from fast background tasks.
     if not ENABLE_ENCODER_DISPLAYS:
         return
 
-    content = small_display_content()
+    display_data = small_display_content()
 
     for channel_number in range(NUMBER_OF_ENCODERS):
-        small_oled = create_small_oled(channel_number)
+        oled = small_displays[channel_number]
 
-        if small_oled is None:
+        if oled is None:
             continue
 
-        line_1 = content[channel_number][0]
-        line_2 = content[channel_number][1]
-        line_3 = content[channel_number][2]
+        if not tca_select_channel(channel_number):
+            continue
 
-        draw_centered_small_display(
-            small_oled,
-            line_1,
-            line_2,
-            line_3
+        top_line = display_data[channel_number][0]
+        middle_line = display_data[channel_number][1]
+        bottom_line = display_data[channel_number][2]
+        highlighted = display_data[channel_number][3]
+
+        draw_small_oled(
+            oled,
+            top_line,
+            middle_line,
+            bottom_line,
+            highlighted
         )
 
     tca_disable_all_channels()
 
 
 # ==================================================
-# RELAY CONTROL
+# DECADE RELAY OUTPUTS
 # ==================================================
 
 def update_relays():
-    # Do not apply normal relay mapping while the relay
-    # test function intentionally holds all outputs on.
     if relay_test_active:
         return
 
@@ -2245,31 +2383,26 @@ def update_relays():
     if extra_one_meg_enabled:
         relay_bits |= (1 << 24)
 
-    # MCP #1 gets relay bits 0..15.
+    # MCP #1 gets bits 0 through 15.
     mcp_write_16_outputs(
         MCP_1_ADDRESS,
         relay_bits & 0xFFFF
     )
 
     # MCP #2:
+    # GPA0-GPA7 = bits 16-23.
+    # GPB0 / GPB1 = available outputs.
+    # GPB2 / GPB3 = door inputs.
+    # GPB4 = +1M relay output.
     #
-    # Port A = relay bits 16..23.
-    # Port B bit 0 / bit 1 are configured as inputs, so
-    # their written output latch state does not drive them.
-    #
-    # 1 MOhm relay uses MCP #2 GPB0 in the old map, but
-    # GPB0 is now a door input. Therefore this framework
-    # maps the 1 MOhm relay to GPB2, output-word bit 10.
-    #
-    # IMPORTANT:
-    # Move the physical 1M ULN2803 control wire from GPB0
-    # to GPB2 when you wire the door inputs.
+    # This keeps the two door inputs away from GPB0/GPB1
+    # as requested, while placing 1M on GPB4.
     relay_word_2 = (
         (relay_bits >> 16) & 0x00FF
     )
 
     if extra_one_meg_enabled:
-        relay_word_2 |= (1 << 10)
+        relay_word_2 |= (1 << 12)
 
     mcp_write_16_outputs(
         MCP_2_ADDRESS,
@@ -2282,7 +2415,7 @@ def relay_test_all_on():
 
     relay_test_active = True
 
-    # MCP #1: all sixteen relay outputs on.
+    # MCP #1: all outputs on.
     mcp_write_16_outputs(
         MCP_1_ADDRESS,
         0xFFFF
@@ -2290,26 +2423,25 @@ def relay_test_all_on():
 
     # MCP #2:
     # Port A all on.
-    # Port B:
-    # GPB0 / GPB1 are DOOR INPUTS, leave them irrelevant.
-    # GPB2-GPB7 outputs on.
+    # GPB0 / GPB1 outputs on.
+    # GPB2 / GPB3 are input pins, unaffected.
+    # GPB4-GPB7 outputs on.
     mcp_write_16_outputs(
         MCP_2_ADDRESS,
-        0xFCFF
+        0xF3FF
     )
 
-    print("Relay test: all relay outputs on")
+    print("Relay test active")
 
 
-def relay_test_all_off():
+def relay_test_stop():
     global relay_test_active
 
     relay_test_active = False
 
-    # Restore normal relay pattern.
     update_relays()
 
-    print("Relay test ended: normal relay pattern restored")
+    print("Relay test stopped")
 
 
 def service_delayed_relay_update():
@@ -2318,29 +2450,26 @@ def service_delayed_relay_update():
     if not relay_update_pending:
         return
 
-    elapsed_time = utime.ticks_diff(
+    elapsed = utime.ticks_diff(
         utime.ticks_ms(),
         last_value_change_time
     )
 
-    if elapsed_time >= RELAY_SETTLE_DELAY_MS:
+    if elapsed >= RELAY_SETTLE_DELAY_MS:
         update_relays()
 
         relay_update_pending = False
 
-        if i2c_debug_enabled:
-            print("Relays updated")
-
 
 # ==================================================
-# METER FUNCTIONS
+# LIVE METER FUNCTIONS
 # ==================================================
 
 def update_measurements():
     global measured_power_watts
 
     if ENABLE_CURRENT_VOLTAGE_METER:
-        # Future INA226 / INA228 logic belongs here.
+        # Future INA226 / INA228 code goes here.
         pass
 
     measured_power_watts = (
@@ -2357,7 +2486,7 @@ def update_temperature():
     global temperature_celsius
 
     if ENABLE_TEMPERATURE_SENSOR:
-        # Future temperature sensor code here.
+        # Future temperature-sensor code.
         pass
 
     else:
@@ -2377,26 +2506,24 @@ def calculate_fan_target_percent():
     if fan_mode == FAN_MANUAL:
         return fan_manual_percent
 
-    # Automatic mode uses start/full thresholds as
-    # a dead-band/buffer range.
     if temperature_celsius <= fan_auto_start_c:
         return 0
 
     if temperature_celsius >= fan_auto_full_c:
         return 100
 
-    temperature_range = (
+    span = (
         fan_auto_full_c -
         fan_auto_start_c
     )
 
-    if temperature_range <= 0:
+    if span <= 0:
         return 100
 
     return (
         (temperature_celsius - fan_auto_start_c) *
         100
-    ) // temperature_range
+    ) // span
 
 
 def service_fan_ramp():
@@ -2404,14 +2531,16 @@ def service_fan_ramp():
     global fan_actual_percent
     global fan_last_ramp_time
 
-    fan_target_percent = calculate_fan_target_percent()
+    fan_target_percent = (
+        calculate_fan_target_percent()
+    )
 
-    elapsed_time = utime.ticks_diff(
+    elapsed = utime.ticks_diff(
         utime.ticks_ms(),
         fan_last_ramp_time
     )
 
-    if elapsed_time < fan_ramp_interval_ms:
+    if elapsed < fan_ramp_interval_ms:
         return
 
     fan_last_ramp_time = utime.ticks_ms()
@@ -2447,14 +2576,13 @@ def set_actuator_state(direction, enabled):
     actuator_direction = direction
     actuator_enabled = enabled
 
+    # Add real H-bridge drive code when hardware exists.
     if not ENABLE_LINEAR_ACTUATOR:
         return
 
-    # Add H-bridge control later.
-
 
 # ==================================================
-# TOOL / DOOR SENSOR FUNCTIONS
+# SENSOR FUNCTIONS
 # ==================================================
 
 def update_sensor_inputs():
@@ -2466,7 +2594,7 @@ def update_sensor_inputs():
     )
 
     if ENABLE_HALL_SENSORS:
-        # Future Hall/IR/microswitch tool sensor code.
+        # Future tool Hall sensor reads.
         pass
 
     if ENABLE_RFID_READER:
@@ -2477,8 +2605,7 @@ def update_sensor_inputs():
 # ==================================================
 # LIGHTING FUNCTIONS
 #
-# Up to 12 logical LED ports are reserved in software.
-# Hardware mapping remains a future design task.
+# Up to 12 logical RGBW port zones remain reserved.
 # ==================================================
 
 def apply_brightness(value):
@@ -2554,13 +2681,13 @@ def write_logical_led_port(
     blue,
     white
 ):
-    # Placeholder until the final 12-output LED hardware
-    # arrangement has been selected.
+    # Future hardware mapping point.
     #
-    # The logical port system already supports:
-    # LED_PORT_COUNT = 1 through 12.
-    #
-    # Add actual PIO or external-controller writes later.
+    # A logical port may eventually represent:
+    # - a direct PIO-driven WS2814 signal
+    # - a separate external LED controller channel
+    # - a strip chain
+    # - a physical enclosure lighting zone
     if port_number < 0 or port_number >= 12:
         return
 
@@ -2577,76 +2704,10 @@ def write_logical_led_port(
 
 
 def apply_lighting_mode():
-    # Placeholder logical action only until strips exist.
-    if lighting_mode == LIGHT_TOOL_DETECT:
-        for port_number in range(LED_PORT_COUNT):
-            tool_number = port_number % len(
-                tool_sensor_states
-            )
-
-            if tool_sensor_states[tool_number]:
-                write_logical_led_port(
-                    port_number,
-                    255,
-                    70,
-                    0,
-                    0
-                )
-
-            else:
-                write_logical_led_port(
-                    port_number,
-                    0,
-                    0,
-                    0,
-                    100
-                )
-
-        return
-
-    if lighting_mode == LIGHT_RAINBOW:
-        for port_number in range(LED_PORT_COUNT):
-            phase = (
-                port_number * 255
-            ) // max(1, LED_PORT_COUNT - 1)
-
-            if phase < 85:
-                red = 255 - phase * 3
-                green = phase * 3
-                blue = 0
-
-            elif phase < 170:
-                phase -= 85
-                red = 0
-                green = 255 - phase * 3
-                blue = phase * 3
-
-            else:
-                phase -= 170
-                red = phase * 3
-                green = 0
-                blue = 255 - phase * 3
-
-            write_logical_led_port(
-                port_number,
-                red,
-                green,
-                blue,
-                0
-            )
-
-        return
-
-    red, green, blue, white = static_color_for_mode()
-
-    for port_number in range(LED_PORT_COUNT):
-        write_logical_led_port(
-            port_number,
-            red,
-            green,
-            blue,
-            white
-        )
+    # Placeholder software behavior until RGBW hardware
+    # is attached and individual logical port drivers are
+    # assigned.
+    pass
 
 
 # ==================================================
@@ -2678,8 +2739,6 @@ def enter_selected_page():
     active_page = menu_selected_page
     menu_browser_active = False
 
-    print("Opened page:", PAGE_NAMES[active_page])
-
 
 # ==================================================
 # SETTINGS VALUE FORMATTER
@@ -2697,6 +2756,12 @@ def settings_value_string():
 
     if settings_selected_item == SETTINGS_LED_BRIGHTNESS:
         return str(lighting_brightness)
+
+    if settings_selected_item == SETTINGS_MAIN_OLED_BRIGHTNESS:
+        return str(main_oled_brightness)
+
+    if settings_selected_item == SETTINGS_AUX_OLED_BRIGHTNESS:
+        return str(aux_oled_brightness)
 
     if settings_selected_item == SETTINGS_FAN_LOW:
         return str(fan_low_percent) + "%"
@@ -2728,24 +2793,19 @@ def settings_value_string():
     if settings_selected_item == SETTINGS_POST_SCREEN_TIME:
         return str(post_screen_ms) + "ms"
 
-    if settings_selected_item == SETTINGS_AUX_OLEDS:
-        if ENABLE_ENCODER_DISPLAYS:
-            return "ON"
-        return "OFF"
-
     if settings_selected_item == SETTINGS_I2C_DEBUG:
         if i2c_debug_enabled:
             return "ON"
         return "OFF"
 
     if settings_selected_item == SETTINGS_OPEN_TESTS:
-        return "PRESS E4"
+        return "BUTTON 4"
 
     return ""
 
 
 # ==================================================
-# ENCODER HANDLERS: DECADE BOX
+# ENCODER HANDLERS
 # ==================================================
 
 def handle_decade_encoder(
@@ -2767,17 +2827,12 @@ def handle_decade_encoder(
     last_value_change_time = utime.ticks_ms()
 
 
-# ==================================================
-# ENCODER HANDLERS: LIVE METERS
-# ==================================================
-
 def handle_meter_encoder(
     encoder_number,
     direction
 ):
     global meter_view
 
-    # Encoder 2 is dedicated to selecting the meter view.
     if encoder_number == ENCODER_2:
         meter_view = wrap(
             meter_view + direction,
@@ -2785,10 +2840,6 @@ def handle_meter_encoder(
             METER_VIEW_POWER
         )
 
-
-# ==================================================
-# ENCODER HANDLERS: LIGHTING
-# ==================================================
 
 def handle_lighting_encoder(
     encoder_number,
@@ -2850,10 +2901,6 @@ def handle_lighting_encoder(
     apply_lighting_mode()
 
 
-# ==================================================
-# ENCODER HANDLERS: CLIMATE
-# ==================================================
-
 def handle_climate_encoder(
     encoder_number,
     direction
@@ -2904,10 +2951,6 @@ def handle_climate_encoder(
         mark_settings_unsaved()
 
 
-# ==================================================
-# ENCODER HANDLERS: ACTUATOR
-# ==================================================
-
 def handle_actuator_encoder(
     encoder_number,
     direction
@@ -2922,7 +2965,6 @@ def handle_actuator_encoder(
                 ACTUATOR_EXTEND,
                 True
             )
-
         else:
             set_actuator_state(
                 ACTUATOR_RETRACT,
@@ -2953,10 +2995,6 @@ def handle_actuator_encoder(
             )
 
 
-# ==================================================
-# ENCODER HANDLERS: SENSORS
-# ==================================================
-
 def handle_sensor_encoder(
     encoder_number,
     direction
@@ -2978,24 +3016,6 @@ def handle_sensor_encoder(
             SENSOR_MODE_RFID
         )
 
-    elif encoder_number == ENCODER_3:
-        if direction != 0:
-            tool_sensor_states[0] = (
-                not tool_sensor_states[0]
-            )
-
-    elif encoder_number == ENCODER_4:
-        if direction != 0:
-            tool_sensor_states[1] = (
-                not tool_sensor_states[1]
-            )
-
-    apply_lighting_mode()
-
-
-# ==================================================
-# ENCODER HANDLERS: SETTINGS
-# ==================================================
 
 def handle_settings_config_encoder(
     encoder_number,
@@ -3006,6 +3026,8 @@ def handle_settings_config_encoder(
     global LED_PORT_COUNT
     global LED_PIXELS_PER_PORT
     global lighting_brightness
+    global main_oled_brightness
+    global aux_oled_brightness
     global fan_low_percent
     global fan_medium_percent
     global fan_manual_percent
@@ -3016,12 +3038,11 @@ def handle_settings_config_encoder(
     global meter_refresh_ms
     global boot_screen_ms
     global post_screen_ms
-    global ENABLE_ENCODER_DISPLAYS
     global i2c_debug_enabled
     global lighting_selected_port
 
-    # Encoder 1 selects which setting to edit.
-    if encoder_number == ENCODER_1:
+    # Encoder 6 scrolls settings list, as requested.
+    if encoder_number == ENCODER_6:
         settings_selected_item = wrap(
             settings_selected_item + direction,
             SETTINGS_RELAY_DELAY,
@@ -3065,6 +3086,24 @@ def handle_settings_config_encoder(
             0,
             255
         )
+
+    elif settings_selected_item == SETTINGS_MAIN_OLED_BRIGHTNESS:
+        main_oled_brightness = clamp(
+            main_oled_brightness + direction * 5,
+            0,
+            255
+        )
+
+        apply_main_oled_brightness()
+
+    elif settings_selected_item == SETTINGS_AUX_OLED_BRIGHTNESS:
+        aux_oled_brightness = clamp(
+            aux_oled_brightness + direction * 5,
+            0,
+            255
+        )
+
+        apply_aux_oled_brightness()
 
     elif settings_selected_item == SETTINGS_FAN_LOW:
         fan_low_percent = clamp(
@@ -3141,19 +3180,12 @@ def handle_settings_config_encoder(
             10000
         )
 
-    elif settings_selected_item == SETTINGS_AUX_OLEDS:
-        if direction != 0:
-            ENABLE_ENCODER_DISPLAYS = (
-                not ENABLE_ENCODER_DISPLAYS
-            )
-
     elif settings_selected_item == SETTINGS_I2C_DEBUG:
         if direction != 0:
             i2c_debug_enabled = (
                 not i2c_debug_enabled
             )
 
-    # OPEN TESTS is a button action, not a rotary edit.
     mark_settings_unsaved()
 
 
@@ -3163,8 +3195,8 @@ def handle_settings_test_encoder(
 ):
     global test_selected_item
 
-    # Encoder 1 selects test option.
-    if encoder_number == ENCODER_1:
+    # Encoder 6 scrolls test list too.
+    if encoder_number == ENCODER_6:
         test_selected_item = wrap(
             test_selected_item + direction,
             TEST_RELAY_ALL_ON,
@@ -3181,17 +3213,12 @@ def handle_settings_encoder(
             encoder_number,
             direction
         )
-
     else:
         handle_settings_test_encoder(
             encoder_number,
             direction
         )
 
-
-# ==================================================
-# TOP-LEVEL ENCODER DISPATCH
-# ==================================================
 
 def handle_encoder(
     encoder_number,
@@ -3202,7 +3229,7 @@ def handle_encoder(
     if direction == 0:
         return
 
-    # Menu scrolling is exclusively Encoder 6.
+    # Main menu is entirely Encoder 6.
     if menu_browser_active:
         if encoder_number == ENCODER_6:
             menu_selected_page = wrap(
@@ -3256,7 +3283,7 @@ def handle_encoder(
 
 
 # ==================================================
-# DECADE BOX RESET
+# DECADE BOX ZERO FUNCTION
 # ==================================================
 
 def clear_all_decade_digits():
@@ -3264,56 +3291,58 @@ def clear_all_decade_digits():
     global relay_update_pending
     global last_value_change_time
 
-    for digit_number in range(NUMBER_OF_ENCODERS):
-        digits[digit_number] = 0
+    for index in range(NUMBER_OF_ENCODERS):
+        digits[index] = 0
 
     extra_one_meg_enabled = False
 
     relay_update_pending = True
     last_value_change_time = utime.ticks_ms()
 
-    print("Decade box cleared to 0 ohm")
+    print("Decade box set to 0 ohm")
 
 
 # ==================================================
-# TEST ACTIONS
+# SETTINGS TEST FUNCTIONS
 # ==================================================
 
-def run_display_test():
-    # Main display test.
+def run_main_oled_test():
     display.fill(1)
     display.show()
-    utime.sleep_ms(350)
+    utime.sleep_ms(300)
 
     display.fill(0)
     display.show()
-    utime.sleep_ms(350)
+    utime.sleep_ms(300)
 
-    # Small display tests.
-    if ENABLE_ENCODER_DISPLAYS:
-        for channel_number in range(NUMBER_OF_ENCODERS):
-            small_oled = create_small_oled(
-                channel_number
-            )
 
-            if small_oled is not None:
-                small_oled.fill(1)
-                small_oled.show()
+def run_aux_oled_test():
+    if not ENABLE_ENCODER_DISPLAYS:
+        return
 
-        utime.sleep_ms(350)
+    for channel_number in range(NUMBER_OF_ENCODERS):
+        oled = small_displays[channel_number]
 
-        for channel_number in range(NUMBER_OF_ENCODERS):
-            small_oled = create_small_oled(
-                channel_number
-            )
+        if oled is None:
+            continue
 
-            if small_oled is not None:
-                small_oled.fill(0)
-                small_oled.show()
+        if tca_select_channel(channel_number):
+            oled.fill(1)
+            oled.show()
 
-        tca_disable_all_channels()
+    utime.sleep_ms(300)
 
-    print("Display test completed")
+    for channel_number in range(NUMBER_OF_ENCODERS):
+        oled = small_displays[channel_number]
+
+        if oled is None:
+            continue
+
+        if tca_select_channel(channel_number):
+            oled.fill(0)
+            oled.show()
+
+    tca_disable_all_channels()
 
 
 def run_i2c_scan_test():
@@ -3330,20 +3359,29 @@ def run_i2c_scan_test():
 
 def run_selected_test():
     global settings_view
+    global active_page
 
     if test_selected_item == TEST_RELAY_ALL_ON:
-        relay_test_all_on()
+        # Toggle behavior:
+        # first press starts relay test
+        # second press stops relay test.
+        if relay_test_active:
+            relay_test_stop()
+        else:
+            relay_test_all_on()
 
-    elif test_selected_item == TEST_RELAY_ALL_OFF:
-        relay_test_all_off()
+    elif test_selected_item == TEST_RELAY_STOP:
+        relay_test_stop()
 
-    elif test_selected_item == TEST_DISPLAY_TEST:
-        run_display_test()
+    elif test_selected_item == TEST_MAIN_OLED:
+        run_main_oled_test()
+
+    elif test_selected_item == TEST_AUX_OLEDS:
+        run_aux_oled_test()
 
     elif test_selected_item == TEST_DOOR_INPUTS:
-        # Inputs are continuously read in background.
-        # Main screen will show live result.
         active_page = PAGE_SENSORS
+        settings_view = SETTINGS_VIEW_CONFIG
 
     elif test_selected_item == TEST_I2C_SCAN:
         run_i2c_scan_test()
@@ -3364,10 +3402,11 @@ def handle_short_button_press(button_number):
     global custom_white
     global active_page
     global settings_view
+    global fan_mode
 
     # MENU BROWSER:
-    # Encoder 6 button = enter selection.
-    # Encoder 5 button = cancel / return.
+    # Encoder 6 = enter.
+    # Encoder 5 = cancel/back.
     if menu_browser_active:
         if button_number == ENCODER_6:
             enter_selected_page()
@@ -3377,9 +3416,9 @@ def handle_short_button_press(button_number):
 
         return
 
-    # ACTIVE PAGE:
-    #
-    # Encoder 6 opens menu browser from all active pages.
+    # Encoder 6 opens global menu on active pages,
+    # except Settings where its rotation is used to
+    # select an item but its button still opens Menu.
     if button_number == ENCODER_6:
         open_menu_browser()
         return
@@ -3388,7 +3427,6 @@ def handle_short_button_press(button_number):
     # DECADE BOX BUTTONS
     # ------------------------------------------------
     if active_page == PAGE_DECADE_BOX:
-        # Encoder 1 button = toggle 1 MOhm stage.
         if button_number == ENCODER_1:
             extra_one_meg_enabled = (
                 not extra_one_meg_enabled
@@ -3397,25 +3435,21 @@ def handle_short_button_press(button_number):
             relay_update_pending = True
             last_value_change_time = utime.ticks_ms()
 
-        # Encoder 5 button = quick access to Live Meters.
+        # Encoder 5 button: direct meter shortcut.
         elif button_number == ENCODER_5:
             active_page = PAGE_METERS
 
-        # Optional future dedicated meter button:
-        #
-        # If you later prefer Encoder 2 pushbutton instead
-        # of Encoder 5 for the Decade Box -> Live Meters
-        # shortcut, uncomment the next three lines:
+        # Optional alternate shortcut requested earlier:
+        # uncomment later if Encoder 2 button should also
+        # open the meter from Decade Box.
         #
         # elif button_number == ENCODER_2:
         #     active_page = PAGE_METERS
-        #     return
 
     # ------------------------------------------------
     # LIVE METERS BUTTONS
     # ------------------------------------------------
     elif active_page == PAGE_METERS:
-        # Encoder 2 selects Current / Voltage / Power.
         if button_number == ENCODER_2:
             meter_view = wrap(
                 meter_view + 1,
@@ -3423,7 +3457,6 @@ def handle_short_button_press(button_number):
                 METER_VIEW_POWER
             )
 
-        # Encoder 5 returns directly to Decade Box.
         elif button_number == ENCODER_5:
             active_page = PAGE_DECADE_BOX
 
@@ -3431,7 +3464,7 @@ def handle_short_button_press(button_number):
     # LIGHTING BUTTONS
     # ------------------------------------------------
     elif active_page == PAGE_LIGHTING:
-        # Encoder 4 button changes custom White channel.
+        # Encoder 4 button cycles custom White channel.
         if button_number == ENCODER_4:
             custom_white += 25
 
@@ -3445,10 +3478,7 @@ def handle_short_button_press(button_number):
     # CLIMATE BUTTONS
     # ------------------------------------------------
     elif active_page == PAGE_CLIMATE:
-        # Encoder 1 button cycles fan mode.
         if button_number == ENCODER_1:
-            global fan_mode
-
             fan_mode = wrap(
                 fan_mode + 1,
                 FAN_OFF,
@@ -3460,13 +3490,12 @@ def handle_short_button_press(button_number):
     # ------------------------------------------------
     elif active_page == PAGE_SETTINGS:
         if settings_view == SETTINGS_VIEW_CONFIG:
-            # Encoder 2 button always saves settings,
-            # including when Relay Delay is selected.
+            # Encoder 2 button always saves, including
+            # when Relay Delay is currently selected.
             if button_number == ENCODER_2:
                 save_runtime_settings()
 
-            # Encoder 4 button opens Test submenu only
-            # while OPEN TESTS is selected.
+            # Only relevant if OPEN TESTS is selected.
             elif (
                 button_number == ENCODER_4 and
                 settings_selected_item == SETTINGS_OPEN_TESTS
@@ -3475,18 +3504,16 @@ def handle_short_button_press(button_number):
 
         else:
             # Test submenu:
-            # Encoder 2 button runs selected test.
+            # Encoder 2 button runs / stops a test.
             if button_number == ENCODER_2:
                 run_selected_test()
 
-            # Encoder 4 returns to config submenu.
+            # Button 4 is a direct return to configuration.
             elif button_number == ENCODER_4:
                 settings_view = SETTINGS_VIEW_CONFIG
 
 
 def handle_long_button_press(button_number):
-    # Only on Decade Box page:
-    # Hold Encoder 3 button to zero all digits.
     if (
         not menu_browser_active and
         active_page == PAGE_DECADE_BOX and
@@ -3504,7 +3531,7 @@ def read_buttons():
             sw_pins[button_number].value() == 0
         )
 
-        # New button press, with basic debounce guard.
+        # New press.
         if (
             pressed_now and
             not button_was_pressed[button_number]
@@ -3533,7 +3560,7 @@ def read_buttons():
                     button_number
                 ] = now
 
-        # Long press handling.
+        # Held press.
         if (
             pressed_now and
             button_was_pressed[button_number]
@@ -3559,7 +3586,7 @@ def read_buttons():
 
                 action_occurred = True
 
-        # Released button.
+        # Release.
         if (
             not pressed_now and
             button_was_pressed[button_number]
@@ -3597,41 +3624,41 @@ def read_buttons():
 
 
 # ==================================================
-# SAFE BOOT HANDLER
+# SAFE BOOT SCREEN
 # ==================================================
 
 def run_safe_boot_screen():
     display.fill(0)
 
-    display.text("SAFE MODE", 24, 12)
-    display.text("MAIN LOOP OFF", 8, 28)
-    display.text("CONNECT TO PC", 8, 44)
+    display.text("SAFE MODE", 28, 10)
+    display.text("MAIN LOOP OFF", 12, 27)
+    display.text("PC ACCESS READY", 4, 44)
 
     display.show()
 
     print("SAFE MODE ACTIVE")
-    print("Release GP15 and reset to run program")
+    print("Edit/delete main.py as needed")
+    print("Release GP15 and reset to run normally")
 
     while True:
         utime.sleep_ms(100)
 
 
 # ==================================================
-# BOOT AND POST
+# STARTUP SEQUENCE
 # ==================================================
 
 def startup_sequence():
     draw_boot_screen()
     utime.sleep_ms(boot_screen_ms)
 
-    post_result = run_hardware_post()
+    post = run_hardware_post()
 
     draw_post_screen(
-        post_result[0],
-        post_result[1],
-        post_result[2],
-        post_result[3],
-        post_result[4]
+        post[0],
+        post[1],
+        post[2],
+        post[3]
     )
 
     utime.sleep_ms(post_screen_ms)
@@ -3641,7 +3668,7 @@ def startup_sequence():
 # STARTUP
 # ==================================================
 
-# Ensure normal Ctrl-C keyboard interrupt remains enabled.
+# Explicitly leave Ctrl-C interrupt enabled.
 micropython.kbd_intr(3)
 
 if safe_boot_requested:
@@ -3649,13 +3676,15 @@ if safe_boot_requested:
 
 startup_sequence()
 
-# Apply initial relay pattern.
+apply_main_oled_brightness()
+
+initialize_small_displays()
+apply_aux_oled_brightness()
+
 update_relays()
 
-# Read initial door state.
 update_sensor_inputs()
 
-# Draw all displays once.
 update_main_display()
 update_small_displays()
 
@@ -3676,14 +3705,14 @@ last_main_display_refresh_time = utime.ticks_ms()
 # ==================================================
 # MAIN LOOP
 #
-# Ctrl-C will raise KeyboardInterrupt and return to the
-# REPL because it is intentionally not caught here.
+# Press Ctrl-C in Thonny to stop this loop.
 # ==================================================
 
 while True:
     ui_changed = False
 
-    # Read rotary encoders as quickly as possible.
+    # Encoder scan occurs first and contains no display
+    # I2C operations. This keeps response fast.
     for encoder_number in range(NUMBER_OF_ENCODERS):
         direction = read_encoder_direction(
             encoder_number
@@ -3697,32 +3726,21 @@ while True:
 
             ui_changed = True
 
-    # Read encoder buttons.
+    # Button scan follows encoder scan.
     if read_buttons():
         ui_changed = True
 
-    # Redraw ALL screens only after actual UI interaction.
-    # This avoids small OLED flashing.
+    # OLED updates only after user interface changes.
     if ui_changed:
         update_main_display()
         update_small_displays()
 
-        if (
-            active_page == PAGE_DECADE_BOX and
-            not menu_browser_active
-        ):
-            print(
-                "Resistance:",
-                resistance_string(),
-                "Ohm"
-            )
-
-    # Delayed relay update to avoid chatter.
+    # Non-blocking delayed relay update.
     service_delayed_relay_update()
 
     now = utime.ticks_ms()
 
-    # Meter update. Does not redraw small screens.
+    # Meter task.
     if utime.ticks_diff(
         now,
         last_meter_update_time
@@ -3730,7 +3748,7 @@ while True:
         last_meter_update_time = now
         update_measurements()
 
-    # Temperature/fan update. Does not redraw small screens.
+    # Temperature and fan task.
     if utime.ticks_diff(
         now,
         last_temperature_update_time
@@ -3740,7 +3758,7 @@ while True:
         update_temperature()
         service_fan_ramp()
 
-    # Door/tool sensor update. Does not redraw small screens.
+    # Door / tool sensors.
     if utime.ticks_diff(
         now,
         last_sensor_update_time
@@ -3749,11 +3767,8 @@ while True:
 
         update_sensor_inputs()
 
-        if lighting_mode == LIGHT_TOOL_DETECT:
-            apply_lighting_mode()
-
-    # Main screen only can refresh live page values.
-    # This keeps auxiliary OLEDs stable and non-flashing.
+    # Only the main OLED is refreshed for live pages.
+    # Small OLEDs do NOT update here, preventing flashing.
     if utime.ticks_diff(
         now,
         last_main_display_refresh_time
@@ -3770,5 +3785,4 @@ while True:
         ):
             update_main_display()
 
-    # One millisecond sleep preserves responsive encoder reads.
     utime.sleep_ms(1)
