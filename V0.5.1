@@ -806,18 +806,109 @@ i2c_aux = I2C(
     freq=400000
 )
 
+# ==================================================
+# RESET ALL DISPLAYS AT THE VERY START
+#
+# Turns each OLED off and wipes its memory so no old
+# image is left over from before the reboot.
+# Missing displays are skipped silently.
+# ==================================================
+
+def blank_one_oled(bus, address, height):
+    pages = height // 8
+
+    try:
+        # Display off, simple addressing mode, full-screen window.
+        bus.writeto_mem(
+            address,
+            0x00,
+            bytes([0xAE, 0x20, 0x00, 0x21, 0, 127, 0x22, 0, pages - 1])
+        )
+
+        # Write black pixels to every page.
+        blank_row = bytes(128)
+        for page in range(pages):
+            bus.writeto_mem(address, 0x40, blank_row)
+
+        return True
+
+    except OSError:
+        return False
+
+
+def reset_all_displays():
+    # Main OLED (I2C0)
+    blank_one_oled(i2c_main, MAIN_OLED_ADDRESS, DISPLAY_HEIGHT)
+
+    # Six small OLEDs behind the mux (I2C1, channels 0 to 5)
+    for channel_number in range(NUMBER_OF_ENCODERS):
+        try:
+            i2c_aux.writeto(
+                TCA9548A_ADDRESS,
+                bytes([1 << channel_number])
+            )
+        except OSError:
+            break  # mux missing, so nothing to reset on this bus
+
+        blank_one_oled(i2c_aux, SMALL_OLED_ADDRESS, SMALL_DISPLAY_HEIGHT)
+
+    # Disconnect all mux channels again.
+    try:
+        i2c_aux.writeto(TCA9548A_ADDRESS, bytes([0x00]))
+    except OSError:
+        pass
+
+    utime.sleep_ms(300)  # keep the screens dark long enough to notice
+
+
+reset_all_displays()
 
 # ==================================================
-# MAIN OLED
+# I2C SCAN AT STARTUP + MAIN OLED 
 # ==================================================
 
-display = SSD1306_I2C(
-    DISPLAY_WIDTH,
-    DISPLAY_HEIGHT,
-    i2c_main,
-    addr=MAIN_OLED_ADDRESS
-)
+def safe_scan(bus, bus_name):
+    try:
+        result = bus.scan()
+    except OSError as error:
+        print("Scan failed on", bus_name, error)
+        result = []
 
+    print("Startup scan", bus_name, result)
+    return result
+
+
+main_scan_result = safe_scan(i2c_main, "I2C0")
+aux_scan_result = safe_scan(i2c_aux, "I2C1")
+
+
+class NullDisplay:
+    # Stand-in used when the main OLED is missing.
+    # It accepts every drawing command and does nothing,
+    # so the rest of the program keeps running.
+    def fill(self, *args): pass
+    def text(self, *args): pass
+    def show(self, *args): pass
+    def fill_rect(self, *args): pass
+    def hline(self, *args): pass
+    def pixel(self, *args): pass
+    def write_cmd(self, *args): pass
+
+
+main_oled_ok = False
+
+try:
+    display = SSD1306_I2C(
+        DISPLAY_WIDTH,
+        DISPLAY_HEIGHT,
+        i2c_main,
+        addr=MAIN_OLED_ADDRESS
+    )
+    main_oled_ok = True
+
+except OSError as error:
+    print("MAIN OLED NOT FOUND at", hex(MAIN_OLED_ADDRESS), error)
+    display = NullDisplay()
 
 # ==================================================
 # SAFE BOOT PIN
@@ -839,6 +930,10 @@ safe_boot_requested = (
 # ==================================================
 
 def mcp_write_register(address, register, value):
+    # Skip chips that were not found at startup.
+    if address not in main_scan_result:
+        return False
+
     try:
         i2c_main.writeto_mem(
             address,
@@ -849,7 +944,6 @@ def mcp_write_register(address, register, value):
     except OSError as error:
         print("MCP write failed:", hex(address), error)
         return False
-
 
 def mcp_read_register(address, register):
     result = i2c_main.readfrom_mem(
@@ -1496,7 +1590,47 @@ def run_hardware_post():
         TCA9548A_ADDRESS in aux_scan
     )
 
+# ==================================================
+# DISPLAY ERROR PROTECTION
+#
+# If a screen update fails, skip it, remember to
+# retry shortly, and keep the program running.
+# ==================================================
 
+display_retry_needed = False
+last_display_retry_time = 0
+last_display_error_print_time = 0
+# Remembers what each screen last showed, so unchanged
+# screens are not sent again.
+last_main_buffer = bytearray(DISPLAY_WIDTH * DISPLAY_HEIGHT // 8)
+main_cache_valid = False
+
+last_small_content = [None, None, None, None, None, None]
+
+
+def invalidate_display_cache():
+    # Forget what the screens show, so the next update
+    # redraws all of them.
+    global main_cache_valid
+
+    main_cache_valid = False
+
+    for index in range(NUMBER_OF_ENCODERS):
+        last_small_content[index] = None
+
+def report_display_error(name, error):
+    # Prints at most once every 2 seconds, so a
+    # disconnected screen does not flood the console.
+    global last_display_error_print_time
+
+    now = utime.ticks_ms()
+
+    if utime.ticks_diff(
+        now,
+        last_display_error_print_time
+    ) >= 2000:
+        last_display_error_print_time = now
+        print("Display update failed:", name, error)
 # ==================================================
 # MAIN OLED DRAWING
 #
@@ -1827,36 +1961,60 @@ def draw_settings_page():
             )
 
 
-def update_main_display():
-    display.fill(0)
+def update_main_display(force=False):
+    global display_retry_needed
+    global main_cache_valid
 
-    if menu_browser_active:
-        draw_menu_browser()
+    try:
+        display.fill(0)
 
-    elif active_page == PAGE_DECADE_BOX:
-        draw_decade_box_page()
+        if menu_browser_active:
+            draw_menu_browser()
 
-    elif active_page == PAGE_METERS:
-        draw_meters_page()
+        elif active_page == PAGE_DECADE_BOX:
+            draw_decade_box_page()
 
-    elif active_page == PAGE_LIGHTING:
-        draw_lighting_page()
+        elif active_page == PAGE_METERS:
+            draw_meters_page()
 
-    elif active_page == PAGE_CLIMATE:
-        draw_climate_page()
+        elif active_page == PAGE_LIGHTING:
+            draw_lighting_page()
 
-    elif active_page == PAGE_ACTUATOR:
-        draw_actuator_page()
+        elif active_page == PAGE_CLIMATE:
+            draw_climate_page()
 
-    elif active_page == PAGE_SENSORS:
-        draw_sensors_page()
+        elif active_page == PAGE_ACTUATOR:
+            draw_actuator_page()
 
-    elif active_page == PAGE_SETTINGS:
-        draw_settings_page()
+        elif active_page == PAGE_SENSORS:
+            draw_sensors_page()
 
-    display.show()
+        elif active_page == PAGE_SETTINGS:
+            draw_settings_page()
 
+        picture = getattr(display, "buffer", None)
 
+        # Skip the slow transfer if the picture is unchanged.
+        if (
+            picture is not None and
+            main_cache_valid and
+            not force and
+            picture == last_main_buffer
+        ):
+            return
+
+        display.show()
+
+        if picture is not None:
+            last_main_buffer[:] = picture
+            main_cache_valid = True
+
+    except OSError as error:
+        main_cache_valid = False
+        display_retry_needed = True
+        report_display_error("MAIN OLED", error)
+        
+        
 # ==================================================
 # TCA9548A / SMALL OLED SETUP
 # ==================================================
@@ -2331,13 +2489,16 @@ def draw_small_oled(
     oled.show()
 
 
-def update_small_displays():
+def update_small_displays(force=False):
     # Called only for a user-visible UI change.
-    # Never call from fast background tasks.
+    # Only screens whose text changed are redrawn.
+    global display_retry_needed
+
     if not ENABLE_ENCODER_DISPLAYS:
         return
 
     display_data = small_display_content()
+    channel_was_used = False
 
     for channel_number in range(NUMBER_OF_ENCODERS):
         oled = small_displays[channel_number]
@@ -2345,25 +2506,44 @@ def update_small_displays():
         if oled is None:
             continue
 
-        if not tca_select_channel(channel_number):
+        new_content = display_data[channel_number]
+
+        if (
+            not force and
+            new_content == last_small_content[channel_number]
+        ):
             continue
 
-        top_line = display_data[channel_number][0]
-        middle_line = display_data[channel_number][1]
-        bottom_line = display_data[channel_number][2]
-        highlighted = display_data[channel_number][3]
+        try:
+            channel_was_used = True
 
-        draw_small_oled(
-            oled,
-            top_line,
-            middle_line,
-            bottom_line,
-            highlighted
-        )
+            if not tca_select_channel(channel_number):
+                last_small_content[channel_number] = None
+                display_retry_needed = True
+                continue
 
-    tca_disable_all_channels()
+            draw_small_oled(
+                oled,
+                new_content[0],
+                new_content[1],
+                new_content[2],
+                new_content[3]
+            )
 
+            last_small_content[channel_number] = new_content
 
+        except OSError as error:
+            last_small_content[channel_number] = None
+            display_retry_needed = True
+            report_display_error(
+                "SMALL OLED " + str(channel_number + 1),
+                error
+            )
+
+    if channel_was_used:
+        tca_disable_all_channels()
+        
+        
 # ==================================================
 # DECADE RELAY OUTPUTS
 # ==================================================
@@ -3346,17 +3526,32 @@ def run_aux_oled_test():
 
 
 def run_i2c_scan_test():
-    try:
-        print("I2C0:", i2c_main.scan())
-    except OSError as error:
-        print("I2C0 scan error:", error)
+    rescan_i2c_buses()
+    print_scan_report()
 
     try:
-        print("I2C1:", i2c_aux.scan())
+        draw_scan_screen()
     except OSError as error:
-        print("I2C1 scan error:", error)
+        report_display_error("MAIN OLED", error)
 
+    # Stay on the scan screen until any button is pressed
+    # (gives up after 30 seconds).
+    utime.sleep_ms(300)
+    start_time = utime.ticks_ms()
 
+    while utime.ticks_diff(utime.ticks_ms(), start_time) < 30000:
+        if any_button_down():
+            break
+
+        utime.sleep_ms(10)
+
+    # Wait for release, so that press is not used twice.
+    while any_button_down():
+        utime.sleep_ms(10)
+
+    utime.sleep_ms(50)
+    
+    
 def run_selected_test():
     global settings_view
     global active_page
@@ -3388,6 +3583,10 @@ def run_selected_test():
 
     elif test_selected_item == TEST_RETURN_CONFIG:
         settings_view = SETTINGS_VIEW_CONFIG
+        
+    
+    # Tests draw on the screens directly, so force a redraw.
+    invalidate_display_cache()    
 
 
 # ==================================================
@@ -3643,6 +3842,224 @@ def run_safe_boot_screen():
     while True:
         utime.sleep_ms(100)
 
+# ==================================================
+# MISSING DEVICE REPORT
+# ==================================================
+
+def report_missing_devices():
+    missing = []
+
+    if not main_oled_ok:
+        missing.append("MAIN OLED 0x{:02X}".format(MAIN_OLED_ADDRESS))
+
+    if MCP_1_ADDRESS not in main_scan_result:
+        missing.append("MCP #1 0x{:02X}".format(MCP_1_ADDRESS))
+
+    if MCP_2_ADDRESS not in main_scan_result:
+        missing.append("MCP #2 0x{:02X}".format(MCP_2_ADDRESS))
+
+    if TCA9548A_ADDRESS not in aux_scan_result:
+        missing.append("TCA9548A 0x{:02X}".format(TCA9548A_ADDRESS))
+    else:
+        for channel_number in range(NUMBER_OF_ENCODERS):
+            if small_displays[channel_number] is None:
+                missing.append("SMALL OLED " + str(channel_number + 1))
+
+    if len(missing) == 0:
+        print("All expected devices found")
+        return
+
+    print("MISSING DEVICES:")
+    for name in missing:
+        print("  -", name)
+
+    if not main_oled_ok:
+        return  # no screen to show it on
+
+    display.fill(0)
+    display.text("MISSING DEVICE", 8, 0)
+    display.hline(0, 10, DISPLAY_WIDTH, 1)
+
+    max_lines = 5
+    if len(missing) > max_lines:
+        shown = missing[:max_lines - 1]
+        shown.append("+" + str(len(missing) - (max_lines - 1)) + " MORE")
+    else:
+        shown = missing
+
+    y_position = 14
+    for name in shown:
+        display.text(name[:16], 0, y_position)
+        y_position += 10
+
+    display.show()
+
+    hold_time = post_screen_ms
+    if hold_time < 3000:
+        hold_time = 3000
+    utime.sleep_ms(hold_time)
+# ==================================================
+# I2C SCAN, SCAN SCREEN, AND PERIODIC RE-SCAN
+# ==================================================
+
+# Addresses from the project brief.
+EXPECTED_I2C0 = (0x20, 0x24, 0x26, 0x3C, 0x40, 0x4C, 0x70)
+EXPECTED_I2C1 = (0x40, 0x4C, 0x68, 0x70)
+
+RESCAN_INTERVAL_MS = 5000
+
+
+def hex_list(addresses):
+    return " ".join("{:02X}".format(a) for a in addresses)
+
+
+def scan_bus(bus, bus_name, disable_mux=False):
+    # Returns a list of addresses, or None if the scan failed.
+    if disable_mux:
+        # Make sure no mux channel is open, so the small
+        # OLEDs do not show up on the I2C1 scan.
+        try:
+            bus.writeto(TCA9548A_ADDRESS, bytes([0x00]))
+        except OSError:
+            pass
+
+    try:
+        return bus.scan()
+    except OSError as error:
+        print("Scan failed on", bus_name, error)
+        return None
+
+
+def print_bus_report(bus_name, found, expected):
+    not_found = [a for a in expected if a not in found]
+    unexpected = [a for a in found if a not in expected]
+
+    print(bus_name, "found (hex):", hex_list(found) or "none")
+    print(bus_name, "found (dec):", found)
+    print(bus_name, "not found:  ", hex_list(not_found) or "none")
+    print(bus_name, "unexpected: ", hex_list(unexpected) or "none")
+
+
+def print_scan_report():
+    print("---- I2C SCAN REPORT ----")
+    print_bus_report("I2C0", main_scan_result, EXPECTED_I2C0)
+    print_bus_report("I2C1", aux_scan_result, EXPECTED_I2C1)
+    print("-------------------------")
+
+
+def report_changes(bus_name, old_list, new_list):
+    for address in new_list:
+        if address not in old_list:
+            print(bus_name, "device appeared: 0x{:02X}".format(address))
+
+    for address in old_list:
+        if address not in new_list:
+            print(bus_name, "device disappeared: 0x{:02X}".format(address))
+
+
+def draw_scan_bus(name, found, y, max_rows):
+    display.text(
+        name + " " + str(len(found)) + " FOUND",
+        0,
+        y
+    )
+
+    per_row = 5
+
+    for row in range(max_rows):
+        chunk = found[row * per_row:(row + 1) * per_row]
+
+        if len(chunk) == 0:
+            break
+
+        line = hex_list(chunk)
+
+        # Not enough room for everything: end with "..".
+        if (
+            row == max_rows - 1 and
+            len(found) > (row + 1) * per_row
+        ):
+            line = hex_list(chunk[:4]) + " .."
+
+        display.text(line, 0, y + 10 + row * 10)
+
+
+def draw_scan_screen():
+    display.fill(0)
+    display.text("I2C SCAN", 0, 0)
+    display.hline(0, 10, DISPLAY_WIDTH, 1)
+
+    draw_scan_bus("I2C0", main_scan_result, 14, 2)
+    draw_scan_bus("I2C1", aux_scan_result, 46, 1)
+
+    display.show()
+
+
+def rescan_i2c_buses():
+    # Scans both buses, prints any changes, and restores
+    # a main OLED or mux that has come back.
+    global main_scan_result
+    global aux_scan_result
+    global main_oled_ok
+    global display
+    global display_retry_needed
+
+    new_main = scan_bus(i2c_main, "I2C0", False)
+    new_aux = scan_bus(i2c_aux, "I2C1", True)
+
+    # A failed scan keeps the old result, so one bad
+    # scan does not make every device look gone.
+    if new_main is not None:
+        report_changes("I2C0", main_scan_result, new_main)
+        main_scan_result = new_main
+
+        if MAIN_OLED_ADDRESS not in new_main:
+            main_oled_ok = False
+
+        elif not main_oled_ok:
+            try:
+                display = SSD1306_I2C(
+                    DISPLAY_WIDTH,
+                    DISPLAY_HEIGHT,
+                    i2c_main,
+                    addr=MAIN_OLED_ADDRESS
+                )
+
+                main_oled_ok = True
+                apply_main_oled_brightness()
+                invalidate_display_cache()
+                display_retry_needed = True
+                print("Main OLED restored")
+
+            except OSError as error:
+                print("Main OLED restore failed:", error)
+
+    # MCP23017 chips that appear late are only reported here.
+    # Their setup is added with the relay rewrite (step 4).
+
+    if new_aux is not None:
+        tca_was_present = TCA9548A_ADDRESS in aux_scan_result
+
+        report_changes("I2C1", aux_scan_result, new_aux)
+        aux_scan_result = new_aux
+
+        if (
+            TCA9548A_ADDRESS in new_aux and
+            not tca_was_present
+        ):
+            initialize_small_displays()
+            apply_aux_oled_brightness()
+            invalidate_display_cache()
+            display_retry_needed = True
+            print("Small OLEDs set up again")
+
+
+def any_button_down():
+    for pin in sw_pins:
+        if pin.value() == 0:
+            return True
+
+    return False
 
 # ==================================================
 # STARTUP SEQUENCE
@@ -3680,6 +4097,11 @@ apply_main_oled_brightness()
 
 initialize_small_displays()
 apply_aux_oled_brightness()
+report_missing_devices()
+initialize_small_displays()
+apply_aux_oled_brightness()
+report_missing_devices()
+print_scan_report()
 
 update_relays()
 
@@ -3700,6 +4122,7 @@ last_meter_update_time = utime.ticks_ms()
 last_temperature_update_time = utime.ticks_ms()
 last_sensor_update_time = utime.ticks_ms()
 last_main_display_refresh_time = utime.ticks_ms()
+last_i2c_rescan_time = utime.ticks_ms()
 
 
 # ==================================================
@@ -3732,8 +4155,8 @@ while True:
 
     # OLED updates only after user interface changes.
     if ui_changed:
-        update_main_display()
-        update_small_displays()
+        update_main_display(True)
+        update_small_displays(True)
 
     # Non-blocking delayed relay update.
     service_delayed_relay_update()
@@ -3783,6 +4206,22 @@ while True:
                 active_page == PAGE_SENSORS
             )
         ):
-            update_main_display()
+             update_main_display()
+    # Re-scan the I2C buses every few seconds.
+    if utime.ticks_diff(
+        now,
+        last_i2c_rescan_time
+    ) >= RESCAN_INTERVAL_MS:
+        last_i2c_rescan_time = now
+        rescan_i2c_buses() 
+    # Retry screens that failed earlier.
+    if (
+        display_retry_needed and
+        utime.ticks_diff(now, last_display_retry_time) >= 500
+    ):
+        last_display_retry_time = now
+        display_retry_needed = False
+        update_main_display()
+        update_small_displays()
 
     utime.sleep_ms(1)
