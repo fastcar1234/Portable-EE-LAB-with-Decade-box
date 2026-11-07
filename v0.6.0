@@ -3878,7 +3878,7 @@ def run_selected_test():
     elif test_selected_item == TEST_RELAY_STOP:
         relay_test_stop()
 
-    elif test_selected_item == TEST_MAIN_OLED:	```
+    elif test_selected_item == TEST_MAIN_OLED:
         run_main_oled_test()
 
     elif test_selected_item == TEST_AUX_OLEDS:
@@ -4180,7 +4180,7 @@ def report_missing_devices():
     if ENABLE_MCP_3 and MCP_3_ADDRESS not in main_scan_result:
         missing.append("MCP #3 0x{:02X}".format(MCP_3_ADDRESS))
    
-  if (
+    if (
         ENABLE_CURRENT_VOLTAGE_METER and
         INA238_ADDRESS not in aux_scan_result
     ):
